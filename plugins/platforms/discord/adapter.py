@@ -555,6 +555,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
+    "DISCORD_ALLOWED_BOTS", "DISCORD_BOT_ALLOWLIST_REQUIRED",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
 
@@ -1450,6 +1451,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             allow_bots = self._get_allow_bots()
             bot_tag_continuation = self._is_bot_tag_debounce_continuation(message)
             if allow_bots == "none":
+                return False, False
+            if not self._bot_author_allowlisted(message):
                 return False, False
             if (
                 allow_bots == "mentions"
@@ -4914,6 +4917,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Per-profile GATEWAY_ALLOW_ALL_USERS flag."""
         return self._gate_env("GATEWAY_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}
 
+    def _bot_author_allowlisted(self, message: Any) -> bool:
+        """DISCORD_ALLOWED_BOTS / DISCORD_BOT_ALLOWLIST_REQUIRED: whether this bot or webhook author
+        is one of the named IDs (a webhook message's author ID is the webhook ID)."""
+        from gateway.bot_allowlist import bot_author_admitted
+
+        author_id = str(getattr(getattr(message, "author", None), "id", "") or "")
+        return bot_author_admitted(
+            self._gate_raw("allowed_bots", "DISCORD_ALLOWED_BOTS"),
+            self._gate_raw("bot_allowlist_required", "DISCORD_BOT_ALLOWLIST_REQUIRED"),
+            author_id,
+        )
+
     def _get_allow_bots(self) -> str:
         """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
         raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
@@ -7275,6 +7290,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     _gate("allowed_roles", "DISCORD_ALLOWED_ROLES", from_platform_extra=True)
     _gate("allow_all_users", "DISCORD_ALLOW_ALL_USERS", from_platform_extra=True, lower=True)
     _gate("allow_bots", "DISCORD_ALLOW_BOTS", from_platform_extra=True, lower=True)
+    _gate("allowed_bots", "DISCORD_ALLOWED_BOTS", from_platform_extra=True)
+    _gate("bot_allowlist_required", "DISCORD_BOT_ALLOWLIST_REQUIRED", from_platform_extra=True, lower=True)
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")

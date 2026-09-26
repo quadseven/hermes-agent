@@ -1426,6 +1426,15 @@ def _apply_agent_section(agent, _agent_cfg):
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries
+    # Retries on the PRIMARY provider for a transport failure (disconnect, timeout, overload) before
+    # the eager switch to fallback_providers. 2 is the historical value. A self-hosted primary that
+    # sheds load for minutes (a thermal pause) wants more, with api_max_retries above it: past
+    # api_max_retries the fallback runs anyway.
+    try:
+        agent._transport_retries_before_fallback = max(
+            int(_agent_section.get("transport_retries_before_fallback", 2)), 0)
+    except (TypeError, ValueError):
+        agent._transport_retries_before_fallback = 2
     # Bounded post-exhaustion auto-recovery cycles once retries AND the fallback chain are spent
     # on a transient outage (agent/turn_recovery_autorecover.py). 0 disables the ladder.
     try:

@@ -55,6 +55,12 @@ DEFAULT_GATE_MAX_RETRIES = 3
 _MAX_BARRIER_WAIT_S = 30 * 60
 # Bounded tail of a failed gate's combined stdout/stderr fed back to the agent.
 _GATE_OUTPUT_TAIL_CHARS = 3000
+# ``goals.judge``: "llm" (default) asks the auxiliary judge model after the gates pass; "gates" makes
+# the gates the whole judge -- DONE exactly when every gate passes, no model call, so the worker model
+# can never grade its own claim. A goal with no gates under "gates" is never done by itself.
+JUDGE_MODE_LLM = "llm"
+JUDGE_MODE_GATES = "gates"
+_JUDGE_MODES = frozenset({JUDGE_MODE_LLM, JUDGE_MODE_GATES})
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -371,16 +377,18 @@ class GoalGate:
         )
 
 
-def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, str]:
+def run_gate(gate: GoalGate, *, cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> Tuple[bool, int, str]:
     """Run one gate through the shell. Returns ``(passed, exit_code, output_tail)``; a timeout kills
-    the process and counts as exit code -1."""
+    the process and counts as exit code -1. ``env`` is merged over the process environment (the goal
+    context a gate needs: which session, since when)."""
+    run_env = {**os.environ, **env} if env else None
     try:
         # utf-8/replace: operator-configured output is arbitrary bytes; strict codepage decoding of
         # one unmappable byte (emoji/CJK on a non-UTF-8 Windows console) kills the reader thread and
         # the tail the agent needs arrives empty.
         proc = subprocess.run(
             gate.command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=max(1, int(gate.timeout_seconds)), cwd=cwd or None,
+            timeout=max(1, int(gate.timeout_seconds)), cwd=cwd or None, env=run_env,
         )
         combined = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
         return proc.returncode == 0, proc.returncode, combined[-_GATE_OUTPUT_TAIL_CHARS:]
@@ -1063,6 +1071,62 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
+def _goals_config() -> Dict[str, Any]:
+    """The top-level ``goals`` block of config.yaml ({} on any failure)."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config() or {}).get("goals") or {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def goal_judge_mode() -> str:
+    """``goals.judge``: "llm" or "gates". Anything else is "llm" (the upstream default)."""
+    mode = str(_goals_config().get("judge") or JUDGE_MODE_LLM).strip().lower()
+    return mode if mode in _JUDGE_MODES else JUDGE_MODE_LLM
+
+
+def default_gates_from_config() -> List[GoalGate]:
+    """``goals.default_gates``: gates attached to every newly set goal. Each item is a command string
+    or a ``{command, timeout_seconds, max_retries}`` mapping; blank or malformed items are skipped."""
+    raw = _goals_config().get("default_gates") or []
+    if not isinstance(raw, list):
+        return []
+    gates: List[GoalGate] = []
+    for item in raw:
+        spec = {"command": item} if isinstance(item, str) else item
+        if not isinstance(spec, dict):
+            continue
+        try:
+            gate = GoalGate.from_dict(spec)
+        except (TypeError, ValueError):
+            continue
+        if gate.command.strip():
+            gates.append(gate)
+    return gates
+
+
+def goal_rearm_idle_seconds() -> float:
+    """``goals.rearm_idle_seconds``: re-arm an active goal whose session has been idle this long with
+    no continuation queued (a restart, or a turn that ended without a reply). 0 disables."""
+    try:
+        return max(0.0, float(_goals_config().get("rearm_idle_seconds") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def goal_gate_env(session_id: str, state: "GoalState") -> Dict[str, str]:
+    """What a gate knows about the goal it guards. ``HERMES_GOAL_CREATED_AT`` is Unix seconds, so a
+    gate can require its evidence (a PR, a commit) to postdate the goal."""
+    return {
+        "HERMES_GOAL_SESSION_ID": str(session_id or ""),
+        "HERMES_GOAL_CREATED_AT": str(int(state.created_at or 0)),
+        "HERMES_GOAL_TEXT": state.goal or "",
+    }
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -1150,6 +1214,7 @@ class GoalManager:
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
+            gates=default_gates_from_config(),
         )
         return self._save()
 
@@ -1289,8 +1354,9 @@ class GoalManager:
         if state is None or not state.gates:
             return None
 
+        gate_env = goal_gate_env(self.session_id, state)
         for gate in state.gates:
-            passed, exit_code, tail = run_gate(gate)
+            passed, exit_code, tail = run_gate(gate, env=gate_env)
             gate.last_exit_code = exit_code
             gate.last_output_tail = tail
             if passed:
@@ -1474,6 +1540,9 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
+        if goal_judge_mode() == JUDGE_MODE_GATES:
+            return self._gates_only_verdict(state)
+
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
@@ -1532,6 +1601,40 @@ class GoalManager:
             "active", True, self.next_continuation_prompt(), "continue", reason,
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
         )
+
+    def _gates_only_verdict(self, state: GoalState) -> Dict[str, Any]:
+        """``goals.judge: gates``: every gate just passed (a failure returned earlier), so the goal is
+        done; with no gates there is no evidence, so it continues until the budget pauses it."""
+        if state.gates:
+            reason = f"all {len(state.gates)} quality gate(s) passed"
+            state.status, state.last_verdict, state.last_reason = "done", "done", reason
+            self._save()
+            return _decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
+        reason = "judge is gates-only and this goal has no gates, so nothing can mark it done"
+        state.last_verdict, state.last_reason = "continue", reason
+        if state.turns_used >= state.max_turns:
+            return self._budget_pause(state, "continue", reason)
+        self._save()
+        return _decision(
+            "active", True, self.next_continuation_prompt(), "continue", reason,
+            f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
+        )
+
+    def note_rearm(self) -> Optional[str]:
+        """Charge one turn for a re-arm kick and return its prompt, or None when the goal is not
+        active, is parked on a wait barrier, or the charge exhausts the budget (it pauses instead).
+        Charging the budget bounds a turn that keeps ending with no reply: without it the re-arm
+        would fire forever."""
+        state = self._state
+        if state is None or state.status != "active" or self.is_waiting():
+            return None
+        state.turns_used += 1
+        state.last_turn_at = time.time()
+        if state.turns_used > state.max_turns:
+            self._pause_state(f"turn budget exhausted ({state.max_turns}/{state.max_turns}) while re-arming")
+            return None
+        self._save()
+        return self.next_continuation_prompt()
 
     def next_continuation_prompt(self) -> Optional[str]:
         s = self._state
