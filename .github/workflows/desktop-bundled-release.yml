@@ -191,6 +191,8 @@ env:
 
 jobs:
   validate:
+    # Fork guard (quadseven): this job publishes, tags, deploys or pushes; it runs only upstream.
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Pre-build setup
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.

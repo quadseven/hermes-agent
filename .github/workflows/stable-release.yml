@@ -23,6 +23,8 @@ concurrency:
 
 jobs:
   admit:
+    # Fork guard (quadseven): this job publishes, tags, deploys or pushes; it runs only upstream.
+    if: github.repository == 'NousResearch/hermes-agent'
     name: Admit the claim
     # A read token cannot see a draft release, so gh release view answers
     # "release not found" for a draft that exists. Write is the permission
