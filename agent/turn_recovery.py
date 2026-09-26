@@ -1677,6 +1677,13 @@ def _cap_long_context_tier(agent: Any) -> int:
     return old_ctx
 
 
+def transport_retries_before_fallback(agent: Any) -> int:
+    """``agent.transport_retries_before_fallback`` (default 2): primary-provider retries, each with
+    jittered exponential backoff, before a transport failure switches to the fallback chain."""
+    value = getattr(agent, "_transport_retries_before_fallback", 2)
+    return value if isinstance(value, int) and value >= 0 else 2
+
+
 def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_failure: bool) -> str:
     """Status line announcing an eager fallback switch."""
     if is_upstream:
@@ -1877,7 +1884,7 @@ def route_classified_error(
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
-        or (_is_transport_failure and retry_count >= 2)
+        or (_is_transport_failure and retry_count >= transport_retries_before_fallback(agent))
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an

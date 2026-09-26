@@ -111,6 +111,10 @@ DEFAULT_CONFIG = {
         # whole call; the OpenAI SDK also retries transient errors (max_retries=2). Set 1 for fast
         # failover to fallback providers; raise to tolerate longer provider hiccups.
         "api_max_retries": 3,
+        # Retries on the primary provider for a transport failure (disconnect, timeout, overload)
+        # before the eager switch to fallback_providers; backoff is jittered exponential (2s base,
+        # 60s cap). Keep api_max_retries above it: once those are spent the fallback runs anyway.
+        "transport_retries_before_fallback": 2,
         # Once api_max_retries AND the fallback chain are spent on a transient outage (5xx,
         # overloaded/529, connect/read timeouts) with nothing delivered yet, wait and retry this many
         # more cycles (jittered 15/30/60/60/60s; a provider Retry-After wins up to 120s) with a
@@ -1380,6 +1384,18 @@ DEFAULT_CONFIG = {
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
+        # "llm" (default): after the gates pass, the auxiliary goal_judge model decides DONE.
+        # "gates": the gates ARE the judge -- DONE exactly when every gate passes, no model call, so
+        # the worker model never grades its own claim. A goal with no gates is then never done.
+        "judge": "llm",
+        # Gates attached to every newly set goal: command strings or {command, timeout_seconds,
+        # max_retries} mappings. Each runs with HERMES_GOAL_SESSION_ID / HERMES_GOAL_CREATED_AT /
+        # HERMES_GOAL_TEXT in its environment. Unlike /goal gate add, no gateway admin is needed:
+        # the operator set them in config.yaml.
+        "default_gates": [],
+        # Gateway: re-arm an active goal whose session has sat idle this many seconds with nothing
+        # queued (a restart killed its turn, or a turn ended with no reply). 0 = off.
+        "rearm_idle_seconds": 0,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially

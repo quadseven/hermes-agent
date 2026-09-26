@@ -562,7 +562,9 @@ class GatewayAuthorizationMixin:
                     extra = self._adapter_extra_for_source(source)
                 mode = str(_extra_or_secret(extra, "allow_bots", allow_bots_var, "none")).lower().strip()
                 if mode in {"mentions", "all"}:
-                    return True
+                    # An ID allowlist, when configured, narrows WHICH bots skip the human allowlist.
+                    from gateway.bot_allowlist import bot_author_admitted_for
+                    return bot_author_admitted_for(source.platform.value, extra, source.user_id)
         return False
 
     def _legacy_telegram_chat_grant(self, source, group_user_allowlist: str) -> bool:

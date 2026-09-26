@@ -315,6 +315,89 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
+    # ── /goal re-arm — restart and dropped-reply recovery ──────────────
+    async def _goal_rearm_watcher(self, interval: float = 60.0) -> None:
+        """Re-arm active goals that nothing will advance. A goal only moves from the post-turn hook,
+        so a restart (the in-flight turn dies with the process) or a turn that ends with no reply
+        (the hook skips empty text) leaves it active and idle forever. Every ``interval`` this kicks
+        each active, unparked goal whose session is idle and whose last turn is older than
+        ``goals.rearm_idle_seconds``. The first scan after boot is the restart re-arm. Off (returns
+        at once) when the setting is 0, the default. Each kick is charged to the goal's turn budget
+        (``GoalManager.note_rearm``), so a turn that keeps ending empty cannot loop forever."""
+        from hermes_cli.goals import goal_rearm_idle_seconds
+
+        idle_after = await self._run_in_executor_with_context(goal_rearm_idle_seconds)
+        if idle_after <= 0:
+            return
+        logger.info("goal re-arm: armed (kick goals idle > %.0fs)", idle_after)
+        await asyncio.sleep(min(interval, 30.0))  # let platforms finish connecting
+        while self._running:
+            try:
+                await self._goal_rearm_scan(idle_after)
+            except Exception as exc:
+                logger.warning("goal re-arm scan failed: %s", exc)
+            await asyncio.sleep(interval)
+
+    def _goal_rearm_candidates(self, idle_after: float, now: float) -> list:
+        """``(session_key, source, session_id)`` for every routed session whose goal is active and
+        idle past ``idle_after`` seconds. Runs off-loop (SessionDB reads)."""
+        from hermes_cli.goals import GoalManager
+
+        store = self.session_store
+        due = []
+        for entry in store.list_sessions():
+            if entry.origin is None or not entry.session_id or getattr(entry, "suspended", False):
+                continue
+            try:
+                source = self._restored_source(entry)
+                with self._profile_scope_for_source(source):
+                    state = GoalManager(entry.session_id).state
+                if state is None or state.status != "active":
+                    continue
+                last = max(float(state.last_turn_at or 0.0), float(state.created_at or 0.0))
+                if now - last >= idle_after:
+                    due.append((entry.session_key, source, entry.session_id))
+            except Exception:
+                logger.debug("goal re-arm check for %s failed", entry.session_key, exc_info=True)
+        return due
+
+    async def _goal_rearm_scan(self, idle_after: float) -> int:
+        """One re-arm pass; returns how many goals were kicked."""
+        from hermes_cli.goals import GoalManager
+
+        await self._warm_goals_session_db("goal re-arm")
+        now = time.time()
+        due = await self._run_in_executor_with_context(lambda: self._goal_rearm_candidates(idle_after, now))
+        store = self.session_store
+        fired = 0
+        for quick_key, source, session_id in due:
+            # A reset/compression may have published a new owner during the executor hop.
+            if store.peek_session_id(quick_key) != session_id:
+                continue
+            adapter = self._delivery_adapter_for(source)
+            if adapter is None or not getattr(adapter, "_message_handler", None):
+                continue
+            if (
+                self._is_session_running(quick_key)
+                or quick_key in adapter._active_sessions
+                or self._queue_depth(quick_key, adapter=adapter) > 0
+            ):
+                continue  # busy: its own post-turn hook will judge and continue it
+
+            def _charge(sid=session_id, src=source):
+                with self._profile_scope_for_source(src):
+                    return GoalManager(sid).note_rearm()
+
+            prompt = await self._run_in_executor_with_context(_charge)
+            if not prompt:
+                continue
+            logger.info("goal re-arm: kicking idle goal in session %s (%s)", session_id, quick_key)
+            event = self._synthetic_prompt_event(source, prompt)
+            event.metadata["gateway_session_key"] = quick_key
+            await adapter.handle_message(event)
+            fired += 1
+        return fired
+
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
