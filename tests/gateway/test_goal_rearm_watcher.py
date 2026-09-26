@@ -103,4 +103,4 @@ async def test_watcher_is_off_by_default(env, monkeypatch):
 
 def test_watcher_is_spawned_with_the_other_post_reconnect_watchers():
     assert "_goal_rearm_watcher" in GatewayRunner._POST_RECONNECT_WATCHERS
-    assert callable(getattr(GatewayRunner, "_goal_rearm_watcher"))
+    assert callable(GatewayRunner._goal_rearm_watcher)
